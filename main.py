@@ -376,7 +376,8 @@ def scan_moldova_sync():
     ).isoformat()
 
     for result in successful_results:
-        for player in result["players"\]:
+        for player in result["players"
+        ]:
             player_tag = player["tag"]
 
             player["last_seen"] = scan_time
