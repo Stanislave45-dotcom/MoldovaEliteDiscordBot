@@ -364,7 +364,7 @@ def scan_moldova_sync():
     failed_results = []
 
     for result in results:
-        if result["success"\]:
+        if result["success"]:
             successful_results.append(result)
         else:
             failed_results.append(result)
