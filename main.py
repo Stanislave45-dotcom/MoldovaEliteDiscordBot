@@ -1,14 +1,13 @@
 import asyncio
 import json
 import os
-import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import discord
 import requests
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
 
 
 # =====================================
@@ -30,20 +29,12 @@ CR_API_TOKEN = os.getenv(
 # CONFIGURARE
 # =====================================
 
-MOLDOVA_LOCATION_ID = 57000155
-
 API_BASE = "https://proxy.royaleapi.dev/v1"
 
-MOLDOVA_DATABASE = "moldova_players.json"
-ELITE_DATABASE = "elite_players.json"
+DATABASE_FILE = "season_matches.json"
 
-MIN_ELITE_TROPHIES = 13800
-MAX_ELITE_TROPHIES = 14000
-
-MAX_CLANS = 100
-
-# Câte clanuri se verifică simultan
-MAX_WORKERS = 6
+# Verificare la fiecare 60 de secunde
+CHECK_INTERVAL_MINUTES = 1
 
 HEADERS = {
     "Authorization": f"Bearer {CR_API_TOKEN}",
@@ -62,60 +53,118 @@ bot = commands.Bot(
     intents=intents
 )
 
-scan_lock = asyncio.Lock()
+database_lock = asyncio.Lock()
+
 commands_synced = False
 
 
 # =====================================
-# BAZA DE DATE JSON
+# FUNCȚII AUXILIARE
 # =====================================
 
-def load_database(file_name):
-    if not os.path.exists(file_name):
-        return {}
+def normalize_tag(player_tag):
+    player_tag = str(player_tag).strip().upper()
+
+    player_tag = player_tag.replace(
+        "O",
+        "0"
+    )
+
+    if not player_tag.startswith("#"):
+        player_tag = "#" + player_tag
+
+    return player_tag
+
+
+def get_profile_url(player_tag):
+    clean_tag = normalize_tag(
+        player_tag
+    ).replace("#", "")
+
+    return (
+        "https://royaleapi.com/player/"
+        + clean_tag
+    )
+
+
+def utc_now_text():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def format_date(date_text):
+    if not date_text:
+        return "Necunoscută"
+
+    try:
+        date_value = datetime.fromisoformat(
+            date_text.replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        return date_value.strftime(
+            "%d.%m.%Y %H:%M UTC"
+        )
+
+    except ValueError:
+        return date_text
+
+
+# =====================================
+# BAZA DE DATE
+# =====================================
+
+def empty_database():
+    return {
+        "season_started_at": utc_now_text(),
+        "players": {}
+    }
+
+
+def load_database():
+    if not os.path.exists(DATABASE_FILE):
+        return empty_database()
 
     try:
         with open(
-            file_name,
+            DATABASE_FILE,
             "r",
             encoding="utf-8"
         ) as file:
             data = json.load(file)
 
-        if isinstance(data, dict):
-            return data
+        if not isinstance(data, dict):
+            return empty_database()
 
-        # Acceptă și fișiere create inițial cu []
-        if isinstance(data, list):
-            database = {}
+        if "players" not in data:
+            data["players"] = {}
 
-            for player in data:
-                if not isinstance(player, dict):
-                    continue
+        if "season_started_at" not in data:
+            data["season_started_at"] = (
+                utc_now_text()
+            )
 
-                player_tag = player.get("tag")
-
-                if player_tag:
-                    database[player_tag] = player
-
-            return database
-
-        return {}
+        return data
 
     except (
         OSError,
         json.JSONDecodeError
     ) as error:
         print(
-            f"Eroare la citirea {file_name}:",
+            "Eroare citire bază:",
             repr(error)
         )
 
-        return {}
+        return empty_database()
 
 
-def save_database(file_name, database):
-    temporary_file = file_name + ".tmp"
+def save_database(database):
+    temporary_file = (
+        DATABASE_FILE + ".tmp"
+    )
 
     try:
         with open(
@@ -132,18 +181,14 @@ def save_database(file_name, database):
 
         os.replace(
             temporary_file,
-            file_name
-        )
-
-        print(
-            f"Baza {file_name} a fost salvată."
+            DATABASE_FILE
         )
 
         return True
 
     except OSError as error:
         print(
-            f"Eroare la salvarea {file_name}:",
+            "Eroare salvare bază:",
             repr(error)
         )
 
@@ -151,83 +196,17 @@ def save_database(file_name, database):
 
 
 # =====================================
-# TOP 100 CLANURI MOLDOVA
+# CLASH ROYALE API
 # =====================================
 
-def get_top_moldova_clans():
-    url = (
-        f"{API_BASE}/locations/"
-        f"{MOLDOVA_LOCATION_ID}/rankings/clans"
-    )
-
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            params={
-                "limit": MAX_CLANS
-            },
-            timeout=45
-        )
-
-        print(
-            "Clasamentul clanurilor:",
-            response.status_code
-        )
-
-        if response.status_code != 200:
-            print(
-                "Răspuns API:",
-                response.text[:1000]
-            )
-
-            return None, (
-                f"API Clash Royale a răspuns "
-                f"cu HTTP {response.status_code}."
-            )
-
-        data = response.json()
-        clans = data.get("items", [])
-
-        if not clans:
-            return None, (
-                "API-ul nu a returnat clanuri "
-                "pentru Moldova."
-            )
-
-        return clans[:MAX_CLANS], None
-
-    except requests.RequestException as error:
-        print(
-            "Eroare clasament:",
-            repr(error)
-        )
-
-        return None, str(error)
-
-
-# =====================================
-# MEMBRII UNUI CLAN
-# =====================================
-
-def get_clan_players(clan):
-    clan_tag = clan.get("tag")
-
-    if not clan_tag:
-        return {
-            "success": False,
-            "clan_tag": "necunoscut",
-            "players": [],
-            "error": "Clan fără tag."
-        }
-
+def api_get_player(player_tag):
     encoded_tag = quote(
-        clan_tag,
+        normalize_tag(player_tag),
         safe=""
     )
 
     url = (
-        f"{API_BASE}/clans/"
+        f"{API_BASE}/players/"
         f"{encoded_tag}"
     )
 
@@ -235,299 +214,501 @@ def get_clan_players(clan):
         response = requests.get(
             url,
             headers=HEADERS,
-            timeout=45
+            timeout=30
         )
 
         if response.status_code != 200:
             print(
-                "Eroare clan:",
-                clan_tag,
+                "Eroare profil:",
+                player_tag,
                 response.status_code,
-                response.text[:300]
+                response.text[:500]
             )
 
-            return {
-                "success": False,
-                "clan_tag": clan_tag,
-                "players": [],
-                "error": (
-                    f"HTTP {response.status_code}"
-                )
-            }
-
-        clan_data = response.json()
-
-        clan_name = clan_data.get(
-            "name",
-            clan.get(
-                "name",
-                "Clan necunoscut"
+            return None, (
+                f"HTTP {response.status_code}"
             )
-        )
 
-        clan_rank = clan.get(
-            "rank",
-            0
-        )
-
-        members = clan_data.get(
-            "memberList",
-            []
-        )
-
-        players = []
-
-        for member in members:
-            player_tag = member.get("tag")
-
-            if not player_tag:
-                continue
-
-            players.append({
-                "tag": player_tag,
-                "name": member.get(
-                    "name",
-                    "Jucător necunoscut"
-                ),
-                "trophies": int(
-                    member.get(
-                        "trophies",
-                        0
-                    )
-                    or 0
-                ),
-                "role": member.get(
-                    "role",
-                    "member"
-                ),
-                "clan_tag": clan_tag,
-                "clan_name": clan_name,
-                "clan_rank": clan_rank
-            })
-
-        return {
-            "success": True,
-            "clan_tag": clan_tag,
-            "players": players,
-            "error": None
-        }
+        return response.json(), None
 
     except requests.RequestException as error:
         print(
-            "Excepție la clan:",
-            clan_tag,
+            "Excepție profil:",
             repr(error)
         )
 
-        return {
-            "success": False,
-            "clan_tag": clan_tag,
-            "players": [],
-            "error": str(error)
-        }
+        return None, str(error)
 
 
-# =====================================
-# SCANARE MOLDOVA
-# =====================================
-
-def scan_moldova_sync():
-    started_at = time.time()
-
-    clans, ranking_error = (
-        get_top_moldova_clans()
+def api_get_battlelog(player_tag):
+    encoded_tag = quote(
+        normalize_tag(player_tag),
+        safe=""
     )
 
-    if clans is None:
-        return {
-            "success": False,
-            "error": ranking_error
-        }
-
-    print(
-        "Clanuri găsite:",
-        len(clans)
+    url = (
+        f"{API_BASE}/players/"
+        f"{encoded_tag}/battlelog"
     )
 
-    # Scanăm mai multe clanuri simultan
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-        results = list(
-            executor.map(
-                get_clan_players,
-                clans
-            )
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30
         )
 
-    successful_results = []
-    failed_results = []
-
-    for result in results:
-        if result["success"]:
-            successful_results.append(result)
-        else:
-            failed_results.append(result)
-
-    current_players = {}
-
-    scan_time = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    for result in successful_results:
-        for player in result["players"
-        ]:
-            player_tag = player["tag"]
-
-            player["last_seen"] = scan_time
-            player["source"] = (
-                "top_100_moldova_clans"
+        if response.status_code != 200:
+            print(
+                "Eroare battlelog:",
+                player_tag,
+                response.status_code,
+                response.text[:500]
             )
 
-            current_players[player_tag] = (
-                player
+            return None, (
+                f"HTTP {response.status_code}"
             )
 
-    old_database = load_database(
-        MOLDOVA_DATABASE
-    )
+        data = response.json()
 
-    old_tags = set(
-        old_database.keys()
-    )
-
-    current_tags = set(
-        current_players.keys()
-    )
-
-    new_player_tags = (
-        current_tags - old_tags
-    )
-
-    merged_database = dict(
-        old_database
-    )
-
-    # Adaugă sau actualizează jucătorii
-    for player_tag, player in (
-        current_players.items()
-    ):
-        old_player = merged_database.get(
-            player_tag,
-            {}
-        )
-
-        player["first_seen"] = (
-            old_player.get("first_seen")
-            or scan_time
-        )
-
-        old_record = int(
-            old_player.get(
-                "highest_trophies",
-                0
-            )
-            or 0
-        )
-
-        current_trophies = int(
-            player.get(
-                "trophies",
-                0
-            )
-            or 0
-        )
-
-        player["highest_trophies"] = max(
-            old_record,
-            current_trophies
-        )
-
-        merged_database[player_tag] = player
-
-    # Creează baza Elite
-    elite_database = {}
-
-    for player_tag, player in (
-        merged_database.items()
-    ):
-        trophies = int(
-            player.get(
-                "trophies",
-                0
-            )
-            or 0
-        )
-
-        if (
-            MIN_ELITE_TROPHIES
-            <= trophies
-            <= MAX_ELITE_TROPHIES
-        ):
-            elite_database[player_tag] = (
-                player
+        if not isinstance(data, list):
+            return None, (
+                "Răspuns battlelog invalid."
             )
 
-    moldova_saved = save_database(
-        MOLDOVA_DATABASE,
-        merged_database
-    )
+        return data, None
 
-    elite_saved = save_database(
-        ELITE_DATABASE,
-        elite_database
-    )
-
-    failed_tags = [
-        result["clan_tag"]
-        for result in failed_results
-    ]
-
-    if failed_tags:
+    except requests.RequestException as error:
         print(
-            "Clanuri cu eroare:",
-            ", ".join(failed_tags)
+            "Excepție battlelog:",
+            repr(error)
         )
 
-    duration = round(
-        time.time() - started_at,
-        1
+        return None, str(error)
+
+
+# =====================================
+# IDENTIFICARE MECI
+# =====================================
+
+def create_battle_id(
+    battle,
+    tracked_tag
+):
+    battle_time = str(
+        battle.get(
+            "battleTime",
+            ""
+        )
     )
 
-    if not moldova_saved or not elite_saved:
+    battle_type = str(
+        battle.get(
+            "type",
+            ""
+        )
+    )
+
+    tags = []
+
+    for side_name in [
+        "team",
+        "opponent"
+    ]:
+        for participant in battle.get(
+            side_name,
+            []
+        ):
+            participant_tag = participant.get(
+                "tag",
+                ""
+            )
+
+            if participant_tag:
+                tags.append(
+                    participant_tag
+                )
+
+    tags.sort()
+
+    return "|".join([
+        normalize_tag(tracked_tag),
+        battle_time,
+        battle_type,
+        ",".join(tags)
+    ])
+
+
+def find_player_side(
+    battle,
+    player_tag
+):
+    normalized_tag = normalize_tag(
+        player_tag
+    )
+
+    for participant in battle.get(
+        "team",
+        []
+    ):
+        if normalize_tag(
+            participant.get("tag", "")
+        ) == normalized_tag:
+            return "team"
+
+    for participant in battle.get(
+        "opponent",
+        []
+    ):
+        if normalize_tag(
+            participant.get("tag", "")
+        ) == normalized_tag:
+            return "opponent"
+
+    return None
+
+
+def total_crowns(participants):
+    crowns = 0
+
+    for participant in participants:
+        crowns += int(
+            participant.get(
+                "crowns",
+                0
+            )
+            or 0
+        )
+
+    return crowns
+
+
+def get_battle_result(
+    battle,
+    player_tag
+):
+    player_side = find_player_side(
+        battle,
+        player_tag
+    )
+
+    if player_side is None:
+        return "unknown"
+
+    team_crowns = total_crowns(
+        battle.get(
+            "team",
+            []
+        )
+    )
+
+    opponent_crowns = total_crowns(
+        battle.get(
+            "opponent",
+            []
+        )
+    )
+
+    if team_crowns == opponent_crowns:
+        return "draw"
+
+    team_won = (
+        team_crowns > opponent_crowns
+    )
+
+    if player_side == "team":
+        return (
+            "win"
+            if team_won
+            else "loss"
+        )
+
+    return (
+        "loss"
+        if team_won
+        else "win"
+    )
+
+
+# =====================================
+# ÎNREGISTRARE PROFIL
+# =====================================
+
+def create_player_record(
+    profile
+):
+    clan = profile.get(
+        "clan",
+        {}
+    )
+
+    return {
+        "tag": profile.get(
+            "tag",
+            ""
+        ),
+        "name": profile.get(
+            "name",
+            "Jucător necunoscut"
+        ),
+        "trophies": int(
+            profile.get(
+                "trophies",
+                0
+            )
+            or 0
+        ),
+        "best_trophies": int(
+            profile.get(
+                "bestTrophies",
+                0
+            )
+            or 0
+        ),
+        "clan_name": clan.get(
+            "name",
+            "Fără clan"
+        ),
+        "tracked_since": utc_now_text(),
+        "last_checked": None,
+        "matches": 0,
+        "wins": 0,
+        "losses": 0,
+        "draws": 0,
+        "battle_ids": []
+    }
+
+
+# =====================================
+# ACTUALIZARE PROFIL ȘI MECIURI
+# =====================================
+
+def update_player_sync(
+    database,
+    player_tag,
+    import_recent=False
+):
+    player_tag = normalize_tag(
+        player_tag
+    )
+
+    profile, profile_error = (
+        api_get_player(player_tag)
+    )
+
+    if profile is None:
         return {
             "success": False,
-            "error": (
-                "Fișierele bazei de date "
-                "nu au putut fi salvate."
-            )
+            "error": profile_error,
+            "new_player": False,
+            "new_matches": 0
         }
+
+    players = database["players"]
+
+    new_player = (
+        player_tag not in players
+    )
+
+    if new_player:
+        players[player_tag] = (
+            create_player_record(profile)
+        )
+
+    record = players[player_tag]
+
+    record["name"] = profile.get(
+        "name",
+        record.get(
+            "name",
+            "Jucător necunoscut"
+        )
+    )
+
+    record["trophies"] = int(
+        profile.get(
+            "trophies",
+            0
+        )
+        or 0
+    )
+
+    record["best_trophies"] = int(
+        profile.get(
+            "bestTrophies",
+            0
+        )
+        or 0
+    )
+
+    clan = profile.get(
+        "clan",
+        {}
+    )
+
+    record["clan_name"] = clan.get(
+        "name",
+        "Fără clan"
+    )
+
+    battles, battle_error = (
+        api_get_battlelog(player_tag)
+    )
+
+    if battles is None:
+        return {
+            "success": False,
+            "error": battle_error,
+            "new_player": new_player,
+            "new_matches": 0
+        }
+
+    known_ids = set(
+        record.get(
+            "battle_ids",
+            []
+        )
+    )
+
+    # Prima căutare creează baza.
+    # Meciurile recente pot fi importate
+    # doar când import_recent este True.
+    if (
+        new_player
+        and not import_recent
+    ):
+        for battle in battles:
+            battle_id = create_battle_id(
+                battle,
+                player_tag
+            )
+
+            known_ids.add(battle_id)
+
+        record["battle_ids"] = list(
+            known_ids
+        )
+
+        record["last_checked"] = (
+            utc_now_text()
+        )
+
+        return {
+            "success": True,
+            "error": None,
+            "new_player": True,
+            "new_matches": 0
+        }
+
+    new_matches = 0
+
+    # Ordine cronologică
+    for battle in reversed(battles):
+        battle_id = create_battle_id(
+            battle,
+            player_tag
+        )
+
+        if battle_id in known_ids:
+            continue
+
+        result = get_battle_result(
+            battle,
+            player_tag
+        )
+
+        if result == "unknown":
+            continue
+
+        known_ids.add(battle_id)
+
+        record["matches"] += 1
+        new_matches += 1
+
+        if result == "win":
+            record["wins"] += 1
+
+        elif result == "loss":
+            record["losses"] += 1
+
+        elif result == "draw":
+            record["draws"] += 1
+
+    # Păstrăm ultimele 300 de ID-uri
+    record["battle_ids"] = list(
+        known_ids
+    )[-300:]
+
+    record["last_checked"] = (
+        utc_now_text()
+    )
 
     return {
         "success": True,
         "error": None,
-        "clans_found": len(clans),
-        "clans_scanned": len(
-            successful_results
-        ),
-        "failed_clans": len(
-            failed_results
-        ),
-        "players_current": len(
-            current_players
-        ),
-        "players_total": len(
-            merged_database
-        ),
-        "new_players": len(
-            new_player_tags
-        ),
-        "elite_total": len(
-            elite_database
-        ),
-        "duration": duration
+        "new_player": new_player,
+        "new_matches": new_matches
     }
+
+
+# =====================================
+# ACTUALIZARE AUTOMATĂ
+# =====================================
+
+@tasks.loop(
+    minutes=CHECK_INTERVAL_MINUTES
+)
+async def automatic_tracker():
+    async with database_lock:
+        database = load_database()
+
+        player_tags = list(
+            database.get(
+                "players",
+                {}
+            ).keys()
+        )
+
+        if not player_tags:
+            return
+
+        print(
+            "Actualizare automată pentru",
+            len(player_tags),
+            "profiluri."
+        )
+
+        for player_tag in player_tags:
+            try:
+                result = await asyncio.to_thread(
+                    update_player_sync,
+                    database,
+                    player_tag,
+                    False
+                )
+
+                print(
+                    "Actualizare:",
+                    player_tag,
+                    result
+                )
+
+            except Exception as error:
+                print(
+                    "Eroare actualizare:",
+                    player_tag,
+                    repr(error)
+                )
+
+            await asyncio.sleep(0.25)
+
+        save_database(database)
+
+
+@automatic_tracker.before_loop
+async def before_automatic_tracker():
+    await bot.wait_until_ready()
 
 
 # =====================================
@@ -542,333 +723,361 @@ async def on_ready():
         f"Conectat ca {bot.user}"
     )
 
-    if commands_synced:
-        return
+    if not commands_synced:
+        try:
+            synced = await bot.tree.sync()
 
-    try:
-        synced = await bot.tree.sync()
+            commands_synced = True
 
-        commands_synced = True
-
-        print(
-            "Comenzi sincronizate:",
-            len(synced)
-        )
-
-        for command in synced:
             print(
-                "Comandă:",
-                command.name
+                "Comenzi sincronizate:",
+                len(synced)
             )
 
-    except Exception as error:
-        print(
-            "Eroare sincronizare comenzi:",
-            repr(error)
-        )
+            for command in synced:
+                print(
+                    "Comandă:",
+                    command.name
+                )
+
+        except Exception as error:
+            print(
+                "Eroare sincronizare:",
+                repr(error)
+            )
+
+    if not automatic_tracker.is_running():
+        automatic_tracker.start()
 
 
 # =====================================
-# COMANDA /SCANMD
+# COMANDA /MECIURI
 # =====================================
 
 @bot.tree.command(
-    name="scanmd",
-    description="Scanează Top 100 clanuri Moldova"
+    name="meciuri",
+    description=(
+        "Arată meciurile monitorizate "
+        "pentru un profil Clash Royale"
+    )
 )
-async def scanmd(
-    interaction: discord.Interaction
+@app_commands.describe(
+    tag="Tagul jucătorului, ex. #2U0228GUP"
+)
+async def meciuri(
+    interaction: discord.Interaction,
+    tag: str
 ):
-    # Nu permitem două scanări simultan
-    if scan_lock.locked():
-        await interaction.response.send_message(
-            "⏳ O scanare Moldova este deja "
-            "în curs.",
-            ephemeral=True
-        )
-
-        return
-
-    # Confirmă imediat comanda către Discord
     await interaction.response.defer(
         thinking=True
     )
 
-    async with scan_lock:
+    player_tag = normalize_tag(tag)
+
+    async with database_lock:
+        database = load_database()
+
         try:
             result = await asyncio.to_thread(
-                scan_moldova_sync
+                update_player_sync,
+                database,
+                player_tag,
+                False
             )
 
         except Exception as error:
             print(
-                "Eroare /scanmd:",
+                "Eroare /meciuri:",
                 repr(error)
             )
 
             await interaction.followup.send(
-                "❌ Scanarea a eșuat.\n"
+                "❌ Nu am putut verifica "
+                "profilul.\n"
                 f"`{type(error).__name__}: "
-                f"{str(error)[:500]}`"
+                f"{str(error)[:300]}`"
             )
 
             return
 
-    if not result.get("success"):
-        embed = discord.Embed(
-            title="❌ Scanare nereușită",
-            description=(
-                result.get("error")
-                or "Eroare necunoscută."
-            ),
-            color=0xE74C3C
-        )
+        if not result["success"]:
+            await interaction.followup.send(
+                "❌ Profilul nu a putut fi "
+                "găsit sau verificat.\n"
+                f"`{result.get('error')}`"
+            )
 
-        await interaction.followup.send(
-            embed=embed
-        )
+            return
 
-        return
+        save_database(database)
+
+        record = database[
+            "players"
+        ][player_tag]
+
+    matches = int(
+        record.get("matches", 0)
+    )
+
+    wins = int(
+        record.get("wins", 0)
+    )
+
+    losses = int(
+        record.get("losses", 0)
+    )
+
+    draws = int(
+        record.get("draws", 0)
+    )
+
+    if matches > 0:
+        win_rate = (
+            wins / matches
+        ) * 100
+    else:
+        win_rate = 0
+
+    profile_url = get_profile_url(
+        player_tag
+    )
+
+    player_name = record.get(
+        "name",
+        "Jucător necunoscut"
+    )
 
     embed = discord.Embed(
-        title="🇲🇩 Scanare Moldova terminată",
-        description=(
-            "Baza de date a fost actualizată."
+        title=(
+            f"🎮 Meciuri monitorizate: "
+            f"{player_name}"
         ),
-        color=0x2ECC71
+        url=profile_url,
+        color=0x3498DB
     )
 
     embed.add_field(
-        name="🏰 Clanuri găsite",
+        name="🏷️ Tag",
+        value=player_tag,
+        inline=True
+    )
+
+    embed.add_field(
+        name="🏆 Trofee",
         value=str(
-            result["clans_found"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="✅ Clanuri scanate",
-        value=str(
-            result["clans_scanned"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="⚠️ Clanuri cu eroare",
-        value=str(
-            result["failed_clans"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="👥 Jucători în scanare",
-        value=str(
-            result["players_current"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🆕 Jucători noi",
-        value=str(
-            result["new_players"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🗃️ Total baza Moldova",
-        value=str(
-            result["players_total"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="🏆 Elite 13.800–14.000",
-        value=str(
-            result["elite_total"]
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="⏱️ Durată",
-        value=(
-            f'{result["duration"]} secunde'
-        ),
-        inline=True
-    )
-
-    embed.set_footer(
-        text=(
-            "Moldova = jucător observat într-un "
-            "clan din Top 100 Moldova."
-        )
-    )
-
-    await interaction.followup.send(
-        embed=embed
-    )
-
-
-# =====================================
-# COMANDA /ELITE
-# =====================================
-
-@bot.tree.command(
-    name="elite",
-    description="Afișează jucătorii 13800-14000"
-)
-async def elite(
-    interaction: discord.Interaction
-):
-    await interaction.response.defer(
-        thinking=True
-    )
-
-    elite_database = load_database(
-        ELITE_DATABASE
-    )
-
-    if not elite_database:
-        await interaction.followup.send(
-            "📭 Baza Elite este goală.\n"
-            "Execută mai întâi comanda "
-            "`/scanmd`."
-        )
-
-        return
-
-    players = list(
-        elite_database.values()
-    )
-
-    players.sort(
-        key=lambda player: (
-            int(
-                player.get(
-                    "trophies",
-                    0
-                )
-                or 0
-            ),
-            str(
-                player.get(
-                    "name",
-                    ""
-                )
-            ).lower()
-        ),
-        reverse=True
-    )
-
-    # Discord are limite pentru mesaje.
-    # În prima versiune afișăm primii 20.
-    visible_players = players[:20]
-
-    lines = []
-
-    for position, player in enumerate(
-        visible_players,
-        start=1
-    ):
-        player_tag = str(
-            player.get(
-                "tag",
-                ""
-            )
-        )
-
-        tag_without_hash = (
-            player_tag
-            .replace("#", "")
-            .upper()
-        )
-
-        profile_url = (
-            "https://royaleapi.com/player/"
-            + tag_without_hash
-        )
-
-        player_name = str(
-            player.get(
-                "name",
-                "Jucător necunoscut"
-            )
-        )
-
-        trophies = int(
-            player.get(
+            record.get(
                 "trophies",
                 0
             )
-            or 0
-        )
-
-        clan_name = str(
-            player.get(
-                "clan_name",
-                "Fără clan"
-            )
-        )
-
-        # Link apăsabil către RoyaleAPI
-        player_link = (
-            f"[{player_name}]"
-            f"({profile_url})"
-        )
-
-        lines.append(
-            f"**{position}. {player_link}**\n"
-            f"🏆 {trophies} trofee\n"
-            f"🏰 {clan_name}"
-        )
-
-    embed = discord.Embed(
-        title="🏆 Moldova Elite Club",
-        description="\n\n".join(lines),
-        color=0xFFD700
-    )
-
-    embed.add_field(
-        name="Interval",
-        value="13.800–14.000 trofee",
-        inline=True
-    )
-
-    embed.add_field(
-        name="Total găsiți",
-        value=str(
-            len(players)
         ),
         inline=True
     )
 
-    if len(players) > 20:
-        footer_text = (
-            f"Sunt afișați primii 20 din "
-            f"{len(players)} jucători."
+    embed.add_field(
+        name="🏰 Clan",
+        value=record.get(
+            "clan_name",
+            "Fără clan"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="🎮 Meciuri",
+        value=str(matches),
+        inline=True
+    )
+
+    embed.add_field(
+        name="✅ Victorii",
+        value=str(wins),
+        inline=True
+    )
+
+    embed.add_field(
+        name="❌ Înfrângeri",
+        value=str(losses),
+        inline=True
+    )
+
+    embed.add_field(
+        name="➖ Egaluri",
+        value=str(draws),
+        inline=True
+    )
+
+    embed.add_field(
+        name="📊 Rată de victorie",
+        value=f"{win_rate:.1f}%",
+        inline=True
+    )
+
+    embed.add_field(
+        name="📅 Monitorizat din",
+        value=format_date(
+            record.get(
+                "tracked_since"
+            )
+        ),
+        inline=False
+    )
+
+    if result["new_player"]:
+        embed.description = (
+            "🆕 Profilul a fost înregistrat.\n"
+            "Numărătoarea exactă începe acum."
         )
+
+    elif result["new_matches"] > 0:
+        embed.description = (
+            f"Au fost găsite "
+            f"**{result['new_matches']}** "
+            f"meciuri noi."
+        )
+
     else:
-        footer_text = (
-            "Apasă pe numele jucătorului "
-            "pentru profilul RoyaleAPI."
+        embed.description = (
+            "Nu au fost găsite meciuri noi "
+            "de la ultima verificare."
         )
 
     embed.set_footer(
-        text=footer_text
+        text=(
+            "Battle log-ul este limitat. "
+            "Botul numără exact doar meciurile "
+            "observate după înregistrare."
+        )
+    )
+
+    view = discord.ui.View()
+
+    view.add_item(
+        discord.ui.Button(
+            label="Vezi profilul pe RoyaleAPI",
+            url=profile_url,
+            emoji="👤"
+        )
     )
 
     await interaction.followup.send(
-        embed=embed
+        embed=embed,
+        view=view
     )
 
 
 # =====================================
-# TRATAREA ERORILOR
+# COMANDA /RESETSEZON
+# =====================================
+
+@bot.tree.command(
+    name="resetsezon",
+    description=(
+        "Resetează contoarele tuturor "
+        "profilurilor monitorizate"
+    )
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def resetsezon(
+    interaction: discord.Interaction
+):
+    await interaction.response.defer(
+        thinking=True,
+        ephemeral=True
+    )
+
+    async with database_lock:
+        database = load_database()
+
+        reset_time = utc_now_text()
+
+        database["season_started_at"] = (
+            reset_time
+        )
+
+        for record in database.get(
+            "players",
+            {}
+        ).values():
+            record["tracked_since"] = (
+                reset_time
+            )
+
+            record["matches"] = 0
+            record["wins"] = 0
+            record["losses"] = 0
+            record["draws"] = 0
+
+            # Golim ID-urile.
+            # La următoarea verificare,
+            # battle log-ul recent va putea
+            # fi folosit ca nou punct de pornire.
+            record["battle_ids"] = []
+
+        save_database(database)
+
+    await interaction.followup.send(
+        "✅ Contoarele sezonului au fost "
+        "resetate.\n\n"
+        "⚠️ Rulează `/meciuri` pentru fiecare "
+        "profil înainte de alte meciuri, pentru "
+        "a crea noul punct de pornire.",
+        ephemeral=True
+    )
+
+
+# =====================================
+# COMANDA /STERGEPROFIL
+# =====================================
+
+@bot.tree.command(
+    name="stergeprofil",
+    description=(
+        "Șterge un profil din monitorizare"
+    )
+)
+@app_commands.describe(
+    tag="Tagul profilului care va fi șters"
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def stergeprofil(
+    interaction: discord.Interaction,
+    tag: str
+):
+    player_tag = normalize_tag(tag)
+
+    async with database_lock:
+        database = load_database()
+
+        players = database.get(
+            "players",
+            {}
+        )
+
+        if player_tag not in players:
+            await interaction.response.send_message(
+                "❌ Profilul nu este monitorizat.",
+                ephemeral=True
+            )
+
+            return
+
+        del players[player_tag]
+
+        save_database(database)
+
+    await interaction.response.send_message(
+        f"✅ Profilul `{player_tag}` a fost "
+        "șters din monitorizare.",
+        ephemeral=True
+    )
+
+
+# =====================================
+# ERORI COMENZI
 # =====================================
 
 @bot.tree.error
@@ -877,7 +1086,7 @@ async def command_error(
     error
 ):
     print(
-        "Eroare comandă Discord:",
+        "Eroare comandă:",
         repr(error)
     )
 
@@ -899,17 +1108,17 @@ async def command_error(
 
 
 # =====================================
-# VERIFICAREA VARIABILELOR
+# VERIFICARE VARIABILE
 # =====================================
 
 if not DISCORD_TOKEN:
     raise RuntimeError(
-        "Lipsește variabila DISCORD_TOKEN."
+        "Lipsește DISCORD_TOKEN."
     )
 
 if not CR_API_TOKEN:
     raise RuntimeError(
-        "Lipsește variabila CR_API_TOKEN."
+        "Lipsește CR_API_TOKEN."
     )
 
 
